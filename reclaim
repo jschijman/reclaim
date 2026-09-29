@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+# reclaim - Free up disk space without losing anything that matters: browse the
+# caches, dependencies and build output your toolchains leave behind.
+#
+# Groups everything by PROJECT (one row per project, never per subfolder) and
+# shows how much each one wastes in three categories:
+#
+#   CACHE  toolchain caches (~/.cache, ~/.m2/repository, ~/.pub-cache, ...)
+#   DEPS   re-downloadable dependencies (node_modules, .venv, Pods, ...)
+#   BUILD  reproducible build output (build/, dist/, target/, .dart_tool, ...)
+#
+# Generic names (build, dist, target) are only ever listed when git declares
+# them ignored in that repo, so committed vendored code is never touched.
+#
+# Usage:
+#   reclaim                 interactive browser
+#   reclaim --list          print the table and exit
+#   reclaim --rescan        force a fresh scan
+#   reclaim --dry-run       never delete, just report what it would do
+#   reclaim --min 100M      hide projects below a size (default 10M, 0 = all)
+#   reclaim --root DIR      scan DIR instead of $HOME
+#
+# Keys:  Up/Down k/j  move    PgUp/PgDn  page    g/G  top/bottom
+#        Enter/Right  open the project: pick ALL or an individual subfolder
+#        Left/Esc     back to the project list
+#        r            rescan        q  quit
+
+set -uo pipefail
+
+ROOT="$HOME"
+DRY_RUN=0
+FORCE_RESCAN=0
+LIST_ONLY=0
+MIN_HUMAN="10M"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list)    LIST_ONLY=1 ;;
+    --rescan)  FORCE_RESCAN=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --min)     MIN_HUMAN="${2:?--min needs a size, e.g. 100M or 0}"; shift ;;
+    --root)    ROOT="${2:?--root needs a directory}"; shift ;;
+    -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
+    *)         printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ROOT="$(cd "$ROOT" && pwd -P)" || exit 1
+MIN_BYTES="$(numfmt --from=iec "$MIN_HUMAN" 2>/dev/null)" ||
+  { printf 'bad --min value: %s\n' "$MIN_HUMAN" >&2; exit 2; }
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/reclaim"
+mkdir -p "$STATE_DIR"
+RAW="$STATE_DIR/artifacts.tsv"     # size \t category \t artifact_dir \t project
+AGG="$STATE_DIR/projects.tsv"      # total \t ndirs \t cats \t project
+STAMP="$STATE_DIR/last-scan"       # mtime = when the scan ran
+
+LEGEND="C cache   D deps (re-downloadable)   B build (reproducible)"
+
+# When the data was collected. Uses its own stamp file, so that deleting a
+# project (which rewrites $RAW) does not look like a fresh scan.
+scan_time() {
+  local f="$STAMP" t now age
+  [ -e "$f" ] || f="$AGG"
+  [ -e "$f" ] || { printf 'never'; return; }
+  t="$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)" || { printf 'unknown'; return; }
+  now=$(date +%s); age=$(( now - $(date -r "$f" +%s) ))
+  if   [ "$age" -lt 3600 ];   then printf '%s (%dm ago)' "$t" $((age / 60))
+  elif [ "$age" -lt 86400 ];  then printf '%s (%dh ago)' "$t" $((age / 3600))
+  else                             printf '%s (%dd ago)' "$t" $((age / 86400))
+  fi
+}
+
+# ----------------------------------------------------------------- detection
+
+# Directories we never descend into while scanning.
+PRUNE=(-name .git -o -name .svn -o -name .hg)
+
+# Artifact directories recognised by name alone. Scanning stops at each one,
+# so nested copies are never counted twice.
+DEPS_NAMES=(node_modules .venv venv Pods .symlinks bower_components)
+BUILD_NAMES=(.dart_tool .next .nuxt .svelte-kit .astro .docusaurus .cxx
+             .serverless .stack-work .terraform)
+CACHE_NAMES=(__pycache__ .mypy_cache .pytest_cache .ruff_cache .pytype .tox
+             .nox .turbo .parcel-cache .nyc_output .angular .gradle .dartServer
+             .ipynb_checkpoints)
+
+# Project markers, for the ambiguous build/dist/target names.
+MARKERS=(pubspec.yaml Cargo.toml build.gradle build.gradle.kts settings.gradle
+         pom.xml package.json pyproject.toml setup.py)
+
+# Home-level toolchain caches, checked directly instead of by walking.
+GLOBAL_CACHES=(
+  .cache .ccache .sccache
+  .npm/_cacache .pnpm-store .local/share/pnpm/store .bun/install/cache
+  .yarn/berry/cache
+  .cargo/registry .cargo/git
+  go/pkg/mod go/pkg/sumdb
+  .gradle/caches .gradle/daemon .gradle/native .gradle/jdks .gradle/workers
+  .gradle/kotlin-profile .gradle/wrapper/dists
+  .m2/repository .nuget/packages
+  .pub-cache
+  .conda/pkgs .local/pipx/venvs .local/share/uv .vpython-root
+  .android/cache .android/build-cache
+  .local/share/Trash
+)
+
+# Home-level dirs that share a name with an artifact dir but also hold config
+# worth keeping (~/.gradle has gradle.properties). The walk skips them; their
+# regenerable subdirectories are listed in GLOBAL_CACHES instead.
+SKIP_WHOLE=(.gradle)
+
+# Files that mark the root of a project, used to attribute an artifact dir to
+# the project that owns it. Broader than MARKERS: this only decides grouping.
+ATTR_MARKERS=(.git package.json pubspec.yaml Cargo.toml go.mod pyproject.toml
+              setup.py Gemfile pom.xml build.gradle build.gradle.kts
+              composer.json CMakeLists.txt mix.exs .project)
+
+declare -A PROJCACHE=()
+declare -A GLOBALSET=()
+
+# Home-level containers that are not projects of their own: a cache found under
+# them keeps its full path as the row label instead of collapsing upwards.
+GENERIC_CONTAINERS=(.local .config .var Library)
+
+# global_group <abs path of a global cache> -> the row it belongs to.
+# ~/.gradle/caches and ~/.gradle/daemon collapse into a single "~/.gradle" row,
+# while ~/.local/share/Trash stays on its own (".local" means nothing).
+global_group() {
+  local rel="${1#"$ROOT"/}" first
+  first="${rel%%/*}"
+  if name_in "$first" "${GENERIC_CONTAINERS[@]}"; then
+    printf '%s' "$1"
+  else
+    printf '%s/%s' "$ROOT" "$first"
+  fi
+}
+
+# project_of <dir> -> nearest ancestor holding a marker, else the first level
+# under ROOT. Memoises the whole chain, so siblings are resolved for free.
+project_of() {
+  local start="$1" d="$1" m found="" rel
+  local -a chain=()
+  [ "$start" = "$ROOT" ] && { printf '%s' "$ROOT"; return; }
+  while [ -n "$d" ] && [ "$d" != "$ROOT" ] && [ "$d" != "/" ]; do
+    if [ -n "${PROJCACHE[$d]+x}" ]; then found="${PROJCACHE[$d]}"; break; fi
+    chain+=("$d")
+    for m in "${ATTR_MARKERS[@]}"; do
+      if [ -e "$d/$m" ]; then found="$d"; break; fi
+    done
+    [ -n "$found" ] && break
+    d="${d%/*}"
+  done
+  if [ -z "$found" ]; then
+    rel="${start#"$ROOT"/}"
+    found="$ROOT/${rel%%/*}"
+  fi
+  for d in "${chain[@]}"; do PROJCACHE["$d"]="$found"; done
+  printf '%s' "$found"
+}
+
+name_in() { # name_in <needle> <haystack...>
+  local needle="$1"; shift
+  local x
+  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+build_name_expr() { # echo a "-name a -o -name b" clause for the given names
+  local out=() n
+  for n in "$@"; do out+=(-o -name "$n"); done
+  printf '%s\0' "${out[@]:1}"
+}
+
+# ---------------------------------------------------------------------- scan
+
+scan() {
+  local tmp_list tmp_meta
+  tmp_list="$(mktemp)"; tmp_meta="$(mktemp)"
+  # No RETURN trap here: it stays registered after scan() returns and would
+  # fire again when the *caller* returns, with these locals already gone.
+
+  printf 'Scanning %s ...\n' "$ROOT" >&2
+
+  local all_art=("${DEPS_NAMES[@]}" "${BUILD_NAMES[@]}" "${CACHE_NAMES[@]}")
+  local art_expr=() n
+  for n in "${all_art[@]}"; do art_expr+=(-o -name "$n"); done
+  art_expr=("${art_expr[@]:1}")
+
+  local mark_expr=()
+  for n in "${MARKERS[@]}"; do mark_expr+=(-o -name "$n"); done
+  mark_expr=("${mark_expr[@]:1}")
+
+  # Absolute paths of the global caches, so the walk can skip them.
+  local skip_expr=() g
+  for g in "${GLOBAL_CACHES[@]}" "${SKIP_WHOLE[@]}"; do
+    [ -d "$ROOT/$g" ] && skip_expr+=(-o -path "$ROOT/$g")
+  done
+  [ ${#skip_expr[@]} -gt 0 ] && skip_expr=("${skip_expr[@]:1}")
+
+  # One walk: print artifact dirs (and stop there), plus project markers.
+  {
+    if [ ${#skip_expr[@]} -gt 0 ]; then
+      find "$ROOT" \( "${PRUNE[@]}" -o "${skip_expr[@]}" \) -prune -o \
+        -type d \( "${art_expr[@]}" \) -print -prune -o \
+        -type f \( "${mark_expr[@]}" \) -print 2>/dev/null
+    else
+      find "$ROOT" \( "${PRUNE[@]}" \) -prune -o \
+        -type d \( "${art_expr[@]}" \) -print -prune -o \
+        -type f \( "${mark_expr[@]}" \) -print 2>/dev/null
+    fi
+  } > "$tmp_meta" || true
+
+  # Absolute paths of every global cache that actually exists.
+  GLOBALSET=()
+  for g in "${GLOBAL_CACHES[@]}"; do
+    [ -d "$ROOT/$g" ] && [ ! -L "$ROOT/$g" ] && GLOBALSET["$ROOT/$g"]=1
+  done
+  for g in "$ROOT"/.var/app/*/cache "$ROOT"/flutter/bin/cache \
+           "$ROOT"/development/flutter/bin/cache; do
+    [ -d "$g" ] && [ ! -L "$g" ] && GLOBALSET["$g"]=1
+  done
+
+  # Resolve each hit into "category <TAB> absolute path".
+  {
+    for g in "${!GLOBALSET[@]}"; do printf 'CACHE\t%s\n' "$g"; done
+
+    local hit base dir
+    while IFS= read -r hit; do
+      base="${hit##*/}"
+      if [ -d "$hit" ] && ! [ -f "$hit" ]; then
+        [ -L "$hit" ] && continue
+        if   name_in "$base" "${DEPS_NAMES[@]}";  then printf 'DEPS\t%s\n'  "$hit"
+        elif name_in "$base" "${BUILD_NAMES[@]}"; then printf 'BUILD\t%s\n' "$hit"
+        elif name_in "$base" "${CACHE_NAMES[@]}"; then printf 'CACHE\t%s\n' "$hit"
+        fi
+        continue
+      fi
+      # Marker file: decide build/dist/target via git, as gen-build-excludes does.
+      dir="${hit%/*}"
+      local cands=()
+      case "$base" in
+        pubspec.yaml)                                  cands=(build) ;;
+        Cargo.toml|pom.xml)                            cands=(target) ;;
+        build.gradle|build.gradle.kts|settings.gradle) cands=(build) ;;
+        package.json|pyproject.toml|setup.py)          cands=(dist build) ;;
+      esac
+      [ ${#cands[@]} -eq 0 ] && continue
+      local in_repo=no c
+      git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 && in_repo=yes
+      for c in "${cands[@]}"; do
+        [ -d "$dir/$c" ] || continue
+        [ -L "$dir/$c" ] && continue
+        if [ "$in_repo" = yes ]; then
+          git -C "$dir" check-ignore -q "$c" || continue
+        else
+          # Outside version control only toolchain-owned names are safe.
+          [ "$c" = build ] || [ "$c" = target ] || continue
+        fi
+        printf 'BUILD\t%s\n' "$dir/$c"
+      done
+    done < "$tmp_meta"
+  } | sort -u -t$'\t' -k2,2 > "$tmp_list"
+
+  local total
+  total=$(wc -l < "$tmp_list")
+  printf 'Found %s artifact directories, measuring size ...\n' "$total" >&2
+
+  # One du for everything. --block-size=1 reports actual disk usage in bytes
+  # (not apparent size): with millions of tiny files the 4K block rounding is
+  # the difference between "12 GB" and what the filesystem really gives back.
+  # -x stays on this filesystem.
+  cut -f2 "$tmp_list" | tr '\n' '\0' |
+    du -sx --block-size=1 --files0-from=- 2>/dev/null > "$tmp_meta" || true
+
+  # Attribute each artifact to a project: the enclosing git repo, else the
+  # artifact's parent directory. Global caches stand on their own.
+  : > "$RAW"
+  local -A cat_of=()
+  local line sz path cat proj parent
+  while IFS=$'\t' read -r cat path; do cat_of["$path"]="$cat"; done < "$tmp_list"
+
+  while IFS=$'\t' read -r sz path; do
+    cat="${cat_of[$path]:-BUILD}"
+    parent="${path%/*}"
+    proj=""
+    if [ -n "${GLOBALSET[$path]+x}" ]; then
+      # Toolchain cache: label the row after the home-level dir that owns it.
+      proj="$(global_group "$path")"
+    elif [ "$parent" = "$ROOT" ]; then
+      # Sits directly in the home dir: it is its own row.
+      proj="$path"
+    fi
+    if [ -z "$proj" ]; then
+      proj="$(project_of "$parent")"
+      # A marker sitting at $ROOT itself would swallow every row; ignore it.
+      [ "$proj" = "$ROOT" ] && proj="$parent"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$sz" "$cat" "$path" "$proj" >> "$RAW"
+  done < "$tmp_meta"
+  rm -f "$tmp_list" "$tmp_meta"
+
+  aggregate
+  : > "$STAMP"
+}
+
+aggregate() {
+  awk -F'\t' '
+    { tot[$4] += $1; n[$4]++; seen[$4 SUBSEP $2] = 1 }
+    END {
+      for (p in tot) {
+        cats = ""
+        if ((p SUBSEP "CACHE") in seen) cats = cats "C"
+        if ((p SUBSEP "DEPS")  in seen) cats = cats "D"
+        if ((p SUBSEP "BUILD") in seen) cats = cats "B"
+        printf "%d\t%d\t%s\t%s\n", tot[p], n[p], cats, p
+      }
+    }' "$RAW" | sort -rn -t$'\t' -k1,1 > "$AGG"
+}
+
+human() { numfmt --to=iec --suffix=B --format='%.1f' "${1:-0}" 2>/dev/null || printf '%sB' "${1:-0}"; }
+
+# ------------------------------------------------------------------ free space
+
+DF_SRC=""; DF_SIZE=0; DF_AVAIL=0; DF_PCT=""
+
+# Re-read the filesystem holding ROOT. Called at startup, after every deletion
+# and after a rescan, so the header always reflects reality.
+refresh_df() {
+  local out
+  out="$(df -B1 --output=source,size,used,avail,pcent "$ROOT" 2>/dev/null | tail -n1)"
+  if [ -z "$out" ]; then DF_SRC=""; return; fi
+  read -r DF_SRC DF_SIZE _ DF_AVAIL DF_PCT <<< "$out"
+}
+
+df_text() {
+  if [ -z "$DF_SRC" ]; then printf 'disk: n/a'; return; fi
+  printf 'disk %s   %s free of %s   %s used' \
+    "$DF_SRC" "$(human "$DF_AVAIL")" "$(human "$DF_SIZE")" "$DF_PCT"
+  if [ "${GRAND:-0}" -gt 0 ]; then
+    printf '   ->   %s free if all rows cleared' "$(human $((DF_AVAIL + GRAND)))"
+  fi
+}
+
+# --------------------------------------------------------------------- table
+
+load() {
+  SIZES=(); NDIRS=(); CATS=(); PATHS=()
+  HIDDEN=0; HIDDEN_BYTES=0; GRAND=0
+  local sz nd ct pa
+  while IFS=$'\t' read -r sz nd ct pa; do
+    if [ "$sz" -lt "$MIN_BYTES" ]; then
+      HIDDEN=$((HIDDEN + 1)); HIDDEN_BYTES=$((HIDDEN_BYTES + sz)); continue
+    fi
+    SIZES+=("$sz"); NDIRS+=("$nd"); CATS+=("$ct"); PATHS+=("$pa")
+    GRAND=$((GRAND + sz))
+  done < "$AGG"
+  COUNT=${#PATHS[@]}
+}
+
+rel() { local p="${1#$ROOT/}"; [ "$p" = "$ROOT" ] && p="~"; printf '%s' "$p"; }
+
+print_table() {
+  printf '%s\n\n' "$(df_text)"
+  printf '%10s  %-4s %6s  %s\n' SIZE CATS DIRS PROJECT
+  local i
+  for ((i = 0; i < COUNT; i++)); do
+    printf '%10s  %-4s %6s  %s\n' \
+      "$(human "${SIZES[i]}")" "${CATS[i]}" "${NDIRS[i]}" "$(rel "${PATHS[i]}")"
+  done
+  printf '\n%s reclaimable across %s projects\n' "$(human "$GRAND")" "$COUNT"
+  if [ "$HIDDEN" -gt 0 ]; then
+    printf '%s more in %s projects under the %s threshold (--min 0 to show all)\n' \
+      "$(human "$HIDDEN_BYTES")" "$HIDDEN" "$MIN_HUMAN"
+  fi
+  printf '\nCATS:  %s\n' "$LEGEND"
+  printf 'last scan: %s   (--rescan to refresh)\n' "$(scan_time)"
+}
+
+# ------------------------------------------------------------------ deletion
+
+# Refuse anything that is not a real directory strictly inside ROOT.
+safe_target() {
+  local p="$1"
+  case "$p" in
+    /*) ;;               *) return 1 ;;
+  esac
+  case "$p" in
+    *..*) return 1 ;;
+  esac
+  case "$p" in
+    "$ROOT"/?*) ;;       *) return 1 ;;
+  esac
+  [ -L "$p" ] && return 1
+  [ -d "$p" ] || return 1
+  return 0
+}
+
+dirs_of_project() { awk -F'\t' -v p="$1" '$4 == p { print $1 "\t" $2 "\t" $3 }' "$RAW"; }
+
+# Remove one path and keep $RAW consistent.
+#   owner empty -> the path is a tracked artifact dir: drop its row.
+#   owner set    -> the path is a child of a tracked dir: shrink that row.
+remove_path() {
+  local path="$1" owner="$2" sz="$3"
+  safe_target "$path" || return 2
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  rm -rf -- "$path" || return 1
+  if [ -z "$owner" ]; then
+    awk -F'\t' -v x="$path" '$3 != x' "$RAW" > "$RAW.tmp" && mv "$RAW.tmp" "$RAW"
+  else
+    awk -F'\t' -v x="$owner" -v d="$sz" 'BEGIN { OFS = "\t" }
+      $3 == x { $1 = ($1 > d ? $1 - d : 0) } 1' "$RAW" > "$RAW.tmp" && mv "$RAW.tmp" "$RAW"
+  fi
+  return 0
+}
+
+# Deletion queue, filled by the caller as four parallel arrays.
+DEL_SIZES=(); DEL_CATS=(); DEL_PATHS=(); DEL_OWNER=()
+
+del_reset() { DEL_SIZES=(); DEL_CATS=(); DEL_PATHS=(); DEL_OWNER=(); }
+del_add() { DEL_SIZES+=("$1"); DEL_CATS+=("$2"); DEL_PATHS+=("$3"); DEL_OWNER+=("$4"); }
+del_total() { local t=0 s; for s in ${DEL_SIZES[@]+"${DEL_SIZES[@]}"}; do t=$((t + s)); done; printf '%s' "$t"; }
+
+# Confirm and run the queued deletions. Returns 0 if anything was removed.
+# Reports progress as it goes: rm -rf on a multi-GB tree is not instant.
+run_deletion() {
+  local title="$1" n=${#DEL_PATHS[@]} i shown=0 ans rc
+  [ "$n" -eq 0 ] && return 1
+
+  tput clear
+  printf '%sDelete regenerable data in%s %s\n\n' "${CSI}1;31m" "${CSI}0m" "$title"
+  for ((i = 0; i < n; i++)); do
+    if [ "$shown" -lt 15 ]; then
+      printf '  rm -rf  %10s  %-5s  %s\n' \
+        "$(human "${DEL_SIZES[i]}")" "${DEL_CATS[i]}" "$(rel "${DEL_PATHS[i]}")"
+    fi
+    shown=$((shown + 1))
+  done
+  [ "$shown" -gt 15 ] && printf '  ... and %s more\n' $((shown - 15))
+
+  printf '\n%s %s, %s to free.\n' "$n" \
+    "$([ "$n" -eq 1 ] && printf directory || printf directories)" "$(human "$(del_total)")"
+  [ "$DRY_RUN" -eq 1 ] && printf '%s(dry-run: nothing will actually be removed)%s\n' "${CSI}33m" "${CSI}0m"
+  printf '\nType %sy%s to confirm, anything else to cancel: ' "${CSI}1m" "${CSI}0m"
+
+  ans="$(read_key)"
+  printf '\n'
+  case "$ans" in
+    y|Y) ;;
+    *)   pause_msg "Cancelled. -- any key --"; return 1 ;;
+  esac
+
+  printf '\n%sDeleting %s ...%s\n\n' "${CSI}1;33m" "$title" "${CSI}0m"
+  tput cnorm 2>/dev/null
+  FREED=0
+  for ((i = 0; i < n; i++)); do
+    printf '  [%d/%d] %10s  %-5s  %s ... ' "$((i + 1))" "$n" \
+      "$(human "${DEL_SIZES[i]}")" "${DEL_CATS[i]}" "$(rel "${DEL_PATHS[i]}")"
+    remove_path "${DEL_PATHS[i]}" "${DEL_OWNER[i]}" "${DEL_SIZES[i]}"; rc=$?
+    case "$rc" in
+      0) if [ "$DRY_RUN" -eq 1 ]; then printf '%sdry-run%s\n' "${CSI}33m" "${CSI}0m"
+         else printf '%sok%s\n' "${CSI}32m" "${CSI}0m"; fi
+         FREED=$((FREED + DEL_SIZES[i])) ;;
+      2) printf '%sskipped (unsafe or gone)%s\n' "${CSI}33m" "${CSI}0m" ;;
+      *) printf '%sFAILED%s\n' "${CSI}31m" "${CSI}0m" ;;
+    esac
+  done
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    printf '\n%sUpdating index ...%s' "${CSI}2m" "${CSI}0m"
+    aggregate
+    printf ' done\n'
+  fi
+  load
+  refresh_df
+  tput civis 2>/dev/null
+  printf '\n%sFreed %s.%s  Disk now %s free.' \
+    "${CSI}1;32m" "$(human "$FREED")" "${CSI}0m" "$(human "$DF_AVAIL")"
+  pause_msg "-- any key --"
+  return 0
+}
+
+# ----------------------------------------------------------------------- tui
+
+CSI=$'\e['
+TUI_ACTIVE=0
+
+enter_tui() { tput smcup 2>/dev/null; tput civis 2>/dev/null; TUI_ACTIVE=1; }
+
+# Idempotent: rmcup restores the saved screen, so running it twice would wipe
+# whatever was printed after the first restore (the exit summary).
+leave_tui() {
+  [ "$TUI_ACTIVE" -eq 1 ] || return 0
+  TUI_ACTIVE=0
+  tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; stty echo 2>/dev/null
+}
+
+read_key() {
+  local k rest
+  IFS= read -rsn1 k || return 1
+  if [ "$k" = $'\e' ]; then
+    read -rsn2 -t 0.05 rest || rest=""
+    k="$k$rest"
+    case "$k" in
+      $'\e[5'|$'\e[6') read -rsn1 -t 0.05 rest || rest=""; k="$k$rest" ;;
+    esac
+  fi
+  printf '%s' "$k"
+}
+
+draw() {
+  local rows cols body i idx line pathw
+  rows=$(tput lines); cols=$(tput cols)
+  body=$((rows - 7)); [ "$body" -lt 3 ] && body=3
+  [ $((SEL - TOP)) -ge "$body" ] && TOP=$((SEL - body + 1))
+  [ "$SEL" -lt "$TOP" ] && TOP=$SEL
+  [ "$TOP" -lt 0 ] && TOP=0
+
+  pathw=$((cols - 26)); [ "$pathw" -lt 20 ] && pathw=20
+
+  tput cup 0 0
+  printf '%s%s%s%s\n' "${CSI}1;32m" "$(df_text)" "${CSI}0m" "${CSI}K"
+  printf '%sreclaim%s  %s reclaimable in %s projects%s%s%s\n' \
+    "${CSI}1;36m" "${CSI}0m" "$(human "$GRAND")" "$COUNT" \
+    "$([ "$HIDDEN" -gt 0 ] && printf '  (+%s hidden <%s)' "$(human "$HIDDEN_BYTES")" "$MIN_HUMAN")" \
+    "$([ "$DRY_RUN" -eq 1 ] && printf '   %s[DRY-RUN]%s' "${CSI}1;33m" "${CSI}0m")" \
+    "${CSI}K"
+  printf '%s%10s  %-4s %6s  %-*s%s%s\n' "${CSI}1;4m" \
+    SIZE CATS DIRS "$pathw" PROJECT "${CSI}0m" "${CSI}K"
+
+  for ((i = 0; i < body; i++)); do
+    idx=$((TOP + i))
+    if [ "$idx" -ge "$COUNT" ]; then printf '%s\n' "${CSI}K"; continue; fi
+    line=$(printf '%10s  %-4s %6s  %-*.*s' \
+      "$(human "${SIZES[idx]}")" "${CATS[idx]}" "${NDIRS[idx]}" \
+      "$pathw" "$pathw" "$(rel "${PATHS[idx]}")")
+    if [ "$idx" -eq "$SEL" ]; then
+      printf '%s%s%s%s\n' "${CSI}7m" "$line" "${CSI}0m" "${CSI}K"
+    else
+      printf '%s%s\n' "$line" "${CSI}K"
+    fi
+  done
+
+  printf '%s\n' "${CSI}K"
+  printf '%sCATS:%s %s   %s|%s  last scan: %s%s\n' \
+    "${CSI}1m" "${CSI}0m" "$LEGEND" "${CSI}2m" "${CSI}0m" "$(scan_time)" "${CSI}K"
+  printf '%s%s%s%s' "${CSI}2m" \
+    "up/down move  enter/right open  r rescan  q quit" "${CSI}0m" "${CSI}K"
+  tput ed 2>/dev/null
+}
+
+pause_msg() {
+  printf '\n\n%s' "$1"
+  read -rsn1 _ || true
+}
+
+# ------------------------------------------------------------------- level 2
+
+L2_SIZES=(); L2_CATS=(); L2_PATHS=(); L2_OWNER=(); L2_PROJ=""; L2_TITLE=""
+
+# Immediate children of a directory, measured in a single walk.
+measure_children() {
+  local dir="$1" sz path
+  du -x --max-depth=1 --block-size=1 "$dir" 2>/dev/null |
+  while IFS=$'\t' read -r sz path; do
+    [ "$path" = "$dir" ] && continue
+    printf '%s\t%s\n' "$sz" "$path"
+  done | sort -rn -t$'\t' -k1,1
+}
+
+# Build the second-level list for a project row.
+#   several tracked dirs (~/.gradle)  -> show those dirs
+#   one tracked cache dir (~/.cache)  -> drill into its immediate children
+build_level2() {
+  local proj="$1" sz cat path i
+  local -a rs=() rc=() rp=()
+  L2_PROJ="$proj"; L2_TITLE="$(rel "$proj")"
+  L2_SIZES=(); L2_CATS=(); L2_PATHS=(); L2_OWNER=()
+
+  while IFS=$'\t' read -r sz cat path; do
+    rs+=("$sz"); rc+=("$cat"); rp+=("$path")
+  done < <(dirs_of_project "$proj" | sort -rn -t$'\t' -k1,1)
+
+  if [ "${#rp[@]}" -eq 1 ] && [ "${rc[0]}" = CACHE ]; then
+    printf '\n  %sMeasuring %s ...%s' "${CSI}2m" "$(rel "${rp[0]}")" "${CSI}0m"
+    while IFS=$'\t' read -r sz path; do
+      L2_SIZES+=("$sz"); L2_CATS+=(CACHE); L2_PATHS+=("$path"); L2_OWNER+=("${rp[0]}")
+    done < <(measure_children "${rp[0]}")
+  fi
+
+  # Not a drill-down case, or the cache dir has no subdirectories.
+  if [ "${#L2_PATHS[@]}" -eq 0 ]; then
+    for ((i = 0; i < ${#rp[@]}; i++)); do
+      L2_SIZES+=("${rs[i]}"); L2_CATS+=("${rc[i]}"); L2_PATHS+=("${rp[i]}"); L2_OWNER+=("")
+    done
+  fi
+}
+
+# Queue every tracked dir of the current project (what "ALL" deletes).
+queue_all() {
+  local sz cat path
+  del_reset
+  while IFS=$'\t' read -r sz cat path; do
+    del_add "$sz" "$cat" "$path" ""
+  done < <(dirs_of_project "$L2_PROJ" | sort -rn -t$'\t' -k1,1)
+}
+
+draw_level2() {
+  local rows cols body i idx line pathw n total=0 s all_total
+  n=${#L2_PATHS[@]}
+  for s in ${L2_SIZES[@]+"${L2_SIZES[@]}"}; do total=$((total + s)); done
+  # Read back from $RAW: after a child deletion the level-1 table has been
+  # rebuilt and SEL may no longer point at this project.
+  all_total=$(dirs_of_project "$L2_PROJ" | awk -F'\t' '{ s += $1 } END { print s + 0 }')
+  rows=$(tput lines); cols=$(tput cols)
+  body=$((rows - 6)); [ "$body" -lt 3 ] && body=3
+  [ $((L2SEL - L2TOP)) -ge "$body" ] && L2TOP=$((L2SEL - body + 1))
+  [ "$L2SEL" -lt "$L2TOP" ] && L2TOP=$L2SEL
+  [ "$L2TOP" -lt 0 ] && L2TOP=0
+  pathw=$((cols - 26)); [ "$pathw" -lt 20 ] && pathw=20
+
+  tput cup 0 0
+  printf '%s%s%s   %s in %s items%s%s\n' "${CSI}1;36m" "$L2_TITLE" "${CSI}0m" \
+    "$(human "$total")" "$n" \
+    "$([ "$DRY_RUN" -eq 1 ] && printf '   %s[DRY-RUN]%s' "${CSI}1;33m" "${CSI}0m")" "${CSI}K"
+  printf '%s%10s  %-5s  %-*s%s%s\n' "${CSI}1;4m" \
+    SIZE CATS "$pathw" ITEM "${CSI}0m" "${CSI}K"
+
+  # Row 0 is the synthetic ALL entry.
+  for ((i = 0; i < body; i++)); do
+    idx=$((L2TOP + i))
+    if [ "$idx" -gt "$n" ]; then printf '%s\n' "${CSI}K"; continue; fi
+    if [ "$idx" -eq 0 ]; then
+      line=$(printf '%10s  %-5s  %-*.*s' \
+        "$(human "$all_total")" "ALL" "$pathw" "$pathw" \
+        "** everything in $L2_TITLE **")
+    else
+      line=$(printf '%10s  %-5s  %-*.*s' \
+        "$(human "${L2_SIZES[idx-1]}")" "${L2_CATS[idx-1]}" \
+        "$pathw" "$pathw" "$(rel "${L2_PATHS[idx-1]}")")
+    fi
+    if [ "$idx" -eq "$L2SEL" ]; then
+      printf '%s%s%s%s\n' "${CSI}7m" "$line" "${CSI}0m" "${CSI}K"
+    else
+      printf '%s%s\n' "$line" "${CSI}K"
+    fi
+  done
+
+  printf '%s\n' "${CSI}K"
+  printf '%sCATS:%s %s%s\n' "${CSI}1m" "${CSI}0m" "$LEGEND" "${CSI}K"
+  printf '%s%s%s%s' "${CSI}2m" \
+    "up/down move  enter delete this  left/esc back  q quit" "${CSI}0m" "${CSI}K"
+  tput ed 2>/dev/null
+}
+
+level2() {
+  local key rows body n
+  tput clear
+  build_level2 "${PATHS[SEL]}"
+  L2SEL=0; L2TOP=0
+  while :; do
+    n=${#L2_PATHS[@]}
+    draw_level2
+    key="$(read_key)" || break
+    rows=$(tput lines); body=$((rows - 6)); [ "$body" -lt 3 ] && body=3
+    case "$key" in
+      q|$'\e'|$'\e[D'|h)  break ;;
+      k|$'\e[A')          [ "$L2SEL" -gt 0 ] && L2SEL=$((L2SEL - 1)) ;;
+      j|$'\e[B')          [ "$L2SEL" -lt "$n" ] && L2SEL=$((L2SEL + 1)) ;;
+      $'\e[5~')           L2SEL=$((L2SEL - body)); [ "$L2SEL" -lt 0 ] && L2SEL=0 ;;
+      $'\e[6~')           L2SEL=$((L2SEL + body)); [ "$L2SEL" -gt "$n" ] && L2SEL=$n ;;
+      g)                  L2SEL=0 ;;
+      G)                  L2SEL=$n ;;
+      ''|$'\n'|$'\r')
+        if [ "$L2SEL" -eq 0 ]; then
+          queue_all
+          if run_deletion "$L2_TITLE"; then
+            [ "$SEL" -ge "$COUNT" ] && SEL=$((COUNT - 1))
+            [ "$SEL" -lt 0 ] && SEL=0
+            break                       # the whole row is gone
+          fi
+        else
+          local i=$((L2SEL - 1))
+          del_reset
+          del_add "${L2_SIZES[i]}" "${L2_CATS[i]}" "${L2_PATHS[i]}" "${L2_OWNER[i]}"
+          if run_deletion "$(rel "${L2_PATHS[i]}")"; then
+            # Drop the deleted item from the level-2 list, keep browsing.
+            L2_SIZES=("${L2_SIZES[@]:0:i}" "${L2_SIZES[@]:i+1}")
+            L2_CATS=("${L2_CATS[@]:0:i}" "${L2_CATS[@]:i+1}")
+            L2_PATHS=("${L2_PATHS[@]:0:i}" "${L2_PATHS[@]:i+1}")
+            L2_OWNER=("${L2_OWNER[@]:0:i}" "${L2_OWNER[@]:i+1}")
+            [ "${#L2_PATHS[@]}" -eq 0 ] && break
+            [ "$L2SEL" -gt "${#L2_PATHS[@]}" ] && L2SEL=${#L2_PATHS[@]}
+          fi
+        fi
+        tput clear ;;
+    esac
+  done
+  tput clear
+}
+
+# Keep the level-1 cursor on the same project after the table is rebuilt.
+resync_sel() {
+  local want="$1" i
+  for ((i = 0; i < COUNT; i++)); do
+    if [ "${PATHS[i]}" = "$want" ]; then SEL=$i; return; fi
+  done
+  [ "$SEL" -ge "$COUNT" ] && SEL=$((COUNT - 1))
+  [ "$SEL" -lt 0 ] && SEL=0
+}
+
+tui() {
+  trap 'leave_tui; exit 130' INT TERM
+  trap leave_tui EXIT
+  enter_tui
+  SEL=0; TOP=0
+  local key rows body
+  while :; do
+    draw
+    key="$(read_key)" || break
+    rows=$(tput lines); body=$((rows - 6)); [ "$body" -lt 3 ] && body=3
+    case "$key" in
+      q|$'\e')                  break ;;
+      k|$'\e[A')                [ "$SEL" -gt 0 ] && SEL=$((SEL - 1)) ;;
+      j|$'\e[B')                [ "$SEL" -lt $((COUNT - 1)) ] && SEL=$((SEL + 1)) ;;
+      $'\e[5~')                 SEL=$((SEL - body)); [ "$SEL" -lt 0 ] && SEL=0 ;;
+      $'\e[6~')                 SEL=$((SEL + body)); [ "$SEL" -ge "$COUNT" ] && SEL=$((COUNT - 1)) ;;
+      g)                        SEL=0 ;;
+      G)                        SEL=$((COUNT - 1)) ;;
+      ' '|''|$'\n'|$'\r'|$'\e[C'|l)
+        if [ "$COUNT" -gt 0 ]; then
+          local want="${PATHS[SEL]}"
+          level2
+          resync_sel "$want"
+        fi ;;
+      r)                        leave_tui; scan; load; refresh_df; enter_tui ;;
+    esac
+    [ "$SEL" -lt 0 ] && SEL=0
+  done
+  leave_tui
+  trap - EXIT INT TERM
+}
+
+# ---------------------------------------------------------------------- main
+
+for cmd in find du df awk sort numfmt; do
+  command -v "$cmd" >/dev/null || { printf 'missing required command: %s\n' "$cmd" >&2; exit 1; }
+done
+
+if [ "$FORCE_RESCAN" -eq 1 ] || [ ! -s "$AGG" ]; then
+  scan
+fi
+load
+refresh_df
+
+if [ "$COUNT" -eq 0 ]; then
+  printf 'Nothing to reclaim under %s\n' "$ROOT"
+  exit 0
+fi
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+  print_table
+  exit 0
+fi
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  print_table
+  exit 0
+fi
+
+tui
+printf '%s reclaimable left in %s projects.  %s free on disk.\n' \
+  "$(human "$GRAND")" "$COUNT" "$(human "$DF_AVAIL")"
