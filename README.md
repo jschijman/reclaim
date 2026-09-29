@@ -30,6 +30,16 @@ last scan: 2026-09-29 13:18 (4m ago)   (--rescan to refresh)
 
 It is a single self-contained Bash script. No dependencies beyond GNU coreutils and `find`.
 
+> ### Scope
+>
+> `reclaim` works on **one directory and everything inside it** — your home directory unless you
+> say otherwise. It never walks upwards, never crosses onto another filesystem, and can only ever
+> delete something it found below that starting point. It is not a whole-disk cleaner and has no
+> way of becoming one.
+>
+> It also **refuses to run as `root`** and **refuses to scan `/` or a system directory**
+> (`/usr`, `/etc`, `/var`, …). Run it as yourself, on your own files.
+
 ---
 
 ## Install
@@ -83,10 +93,31 @@ rm -rf ~/.local/state/reclaim     # cached scan results
 ## Requirements
 
 - **bash 4+** (uses associative arrays)
-- GNU coreutils: `du`, `df`, `sort`, `numfmt`
-- `find`, `awk`, `tput`
+- `du`, `df`, `sort`, `numfmt` — GNU coreutils
+- `find` — findutils
+- `awk` — gawk
+- `tput` — ncurses
 - `git` — optional, but recommended: without it the ambiguous `build/` `dist/` `target/`
   directories are detected far more conservatively
+
+All of these ship with a default install of essentially every Linux distribution, so in practice
+there is nothing to install. If something is genuinely missing, `reclaim` says so on startup and
+prints the exact command for your package manager rather than making you work it out:
+
+```
+$ reclaim
+reclaim needs these commands, which are not installed:
+
+    awk
+    numfmt
+
+Install them with:
+
+    sudo apt install gawk coreutils
+```
+
+It recognises `apt`, `dnf`, `yum`, `zypper`, `pacman`, `apk` and `brew`, and falls back to
+showing both the Debian and Fedora commands when it cannot tell.
 
 Tested on Linux. It should work on macOS with `coreutils` and a modern `bash` from Homebrew
 (the stock macOS `bash` is 3.2 and will not run it).
@@ -101,12 +132,20 @@ reclaim --list          print the table and exit
 reclaim --rescan        force a fresh scan
 reclaim --dry-run       never delete, just report what it would do
 reclaim --min 100M      hide projects below a size (default 10M, 0 = all)
-reclaim --root DIR      scan DIR instead of $HOME
+reclaim --dir DIR       scan DIR instead of your home directory
+reclaim --unsafe        skip the root/system-directory refusals
 reclaim --help          show this
 ```
 
 The first run scans your home directory and caches the result. Later runs start instantly from
 that cache; press `r` (or pass `--rescan`) when you want fresh numbers.
+
+To narrow it down to one tree, point `--dir` at it — everything below it is fair game, nothing
+above it is ever looked at:
+
+```sh
+reclaim --dir ~/Workspace
+```
 
 If stdout is not a terminal, `reclaim` prints the table and exits, so it composes fine in a
 pipeline:
@@ -150,13 +189,18 @@ regenerated, `reclaim` does not list it.
 
 This tool runs `rm -rf`, so its defensive choices are worth stating explicitly:
 
+- **Never as `root`.** `reclaim` exits if it is started with an effective uid of 0. Deleting the
+  wrong directory as your own user costs you a rebuild; as `root` it costs you the machine.
+- **Never on `/` or a system directory.** `/`, `/usr`, `/etc`, `/var`, `/opt` and the rest are
+  refused outright. They are full of paths that look exactly like build output
+  (`/usr/lib/node_modules`, `/var/cache`) but belong to your package manager.
+- **Never outside the scan directory.** Every deletion target is re-validated at the moment of
+  deletion: it must be an absolute path, strictly below the scan directory, contain no `..`, not
+  be a symlink, and still be a real directory. Anything else is skipped and reported as skipped.
 - **Generic names are guarded by git.** `build`, `dist` and `target` are ambiguous — plenty of
   projects commit a folder with one of those names. Inside a git repo, such a directory is only
   ever listed if `git check-ignore` says the repo itself declares it ignored. Outside version
   control, only `build` and `target` qualify, and `dist` is never touched.
-- **Nothing outside the scan root.** Every deletion target is re-validated at delete time: it
-  must be an absolute path, strictly inside the root, contain no `..`, not be a symlink, and
-  still be a real directory. Anything else is skipped and reported as such.
 - **Symlinks are never followed** during scanning or deletion, so a symlinked `node_modules` is
   left alone.
 - **`.git`, `.svn` and `.hg` are never descended into**, so version-control metadata is out of
@@ -167,13 +211,19 @@ This tool runs `rm -rf`, so its defensive choices are worth stating explicitly:
 - **Explicit confirmation**, every time, with the full list and total shown first.
 - **`--dry-run`** does the entire run — scan, browse, confirm — and never removes anything.
 
+The first two refusals can be lifted with `--unsafe`. There are legitimate reasons to want that
+(a build agent's home under `/var/lib`, a container running everything as uid 0), which is why
+the escape hatch exists — but if you are typing it on your laptop, you almost certainly want
+`--dir` instead.
+
 Still, this deletes files. Try `reclaim --dry-run` first.
 
 ## How it works
 
-1. **One `find` pass** over the root. It stops descending as soon as it hits an artifact
-   directory, so nested copies are never double-counted, and it collects project markers
-   (`package.json`, `Cargo.toml`, `pubspec.yaml`, …) in the same walk.
+1. **One `find` pass**, starting at the scan directory and only ever descending. It stops going
+   deeper as soon as it hits an artifact directory, so nested copies are never double-counted,
+   and it collects project markers (`package.json`, `Cargo.toml`, `pubspec.yaml`, …) in the same
+   walk.
 2. **One `du` call** for every candidate, via `--files0-from=-`. Sizes use
    `--block-size=1`, i.e. real disk usage rather than apparent size — with a few million tiny
    files, 4K block rounding is the difference between "12 GB" and what the filesystem actually

@@ -12,13 +12,21 @@
 # Generic names (build, dist, target) are only ever listed when git declares
 # them ignored in that repo, so committed vendored code is never touched.
 #
+# SCOPE: reclaim only ever looks at, and only ever deletes, things inside the
+# scan directory -- your home directory unless --dir says otherwise. It never
+# walks upwards and never leaves that subtree. It refuses to run as root, and
+# refuses to scan / or a system directory; run it as yourself, on your own
+# files.
+#
 # Usage:
 #   reclaim                 interactive browser
 #   reclaim --list          print the table and exit
 #   reclaim --rescan        force a fresh scan
 #   reclaim --dry-run       never delete, just report what it would do
 #   reclaim --min 100M      hide projects below a size (default 10M, 0 = all)
-#   reclaim --root DIR      scan DIR instead of $HOME
+#   reclaim --dir DIR       scan DIR instead of your home directory
+#   reclaim --unsafe        skip the root/system-directory refusals
+#   reclaim --help          show this
 #
 # Keys:  Up/Down k/j  move    PgUp/PgDn  page    g/G  top/bottom
 #        Enter/Right  open the project: pick ALL or an individual subfolder
@@ -27,26 +35,160 @@
 
 set -uo pipefail
 
+name_in() { # name_in <needle> <haystack...>
+  local needle="$1"; shift
+  local x
+  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+# Print the header comment as the help text. Deliberately pure bash: --help has
+# to work even when the dependency check below is about to fail.
+usage() {
+  local line n=0
+  while IFS= read -r line; do
+    n=$((n + 1)); [ "$n" -eq 1 ] && continue
+    case "$line" in
+      '#'*) line="${line#\#}"; printf '%s\n' "${line# }" ;;
+      *)    return 0 ;;
+    esac
+  done < "$0"
+}
+
+# ROOT is the root of the scanned tree, never "the root of the disk": the walk
+# starts here and only ever descends.
 ROOT="$HOME"
 DRY_RUN=0
 FORCE_RESCAN=0
 LIST_ONLY=0
 MIN_HUMAN="10M"
+UNSAFE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --list)    LIST_ONLY=1 ;;
-    --rescan)  FORCE_RESCAN=1 ;;
-    --dry-run) DRY_RUN=1 ;;
-    --min)     MIN_HUMAN="${2:?--min needs a size, e.g. 100M or 0}"; shift ;;
-    --root)    ROOT="${2:?--root needs a directory}"; shift ;;
-    -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
-    *)         printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+    --list)      LIST_ONLY=1 ;;
+    --rescan)    FORCE_RESCAN=1 ;;
+    --dry-run)   DRY_RUN=1 ;;
+    --unsafe)    UNSAFE=1 ;;
+    --min)       MIN_HUMAN="${2:?--min needs a size, e.g. 100M or 0}"; shift ;;
+    --dir|--root) ROOT="${2:?--dir needs a directory}"; shift ;;  # --root: pre-1.0 name
+    -h|--help)   usage; exit 0 ;;
+    *)           printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
 
+# ------------------------------------------------------- dependency checking
+#
+# Runs before anything else touches an external tool: a missing numfmt used to
+# surface as "bad --min value", which tells the user nothing useful.
+
+# Which package ships each command. coreutils covers four of them, but find,
+# awk and tput each come from a package of their own, and the names differ
+# between distro families -- so a bare "install coreutils" would be wrong
+# advice about half the time.
+pkg_for() { # pkg_for <command> <family>
+  case "$1" in
+    du|df|sort|numfmt) printf 'coreutils' ;;
+    find)              printf 'findutils' ;;
+    awk)               printf 'gawk' ;;
+    git)               printf 'git' ;;
+    tput) case "$2" in
+            debian) printf 'ncurses-bin' ;;
+            *)      printf 'ncurses' ;;
+          esac ;;
+  esac
+}
+
+PM_FAMILY=""; PM_CMD=""
+
+detect_pm() {
+  if   command -v apt-get >/dev/null 2>&1; then PM_FAMILY=debian; PM_CMD='sudo apt install'
+  elif command -v dnf     >/dev/null 2>&1; then PM_FAMILY=rhel;   PM_CMD='sudo dnf install'
+  elif command -v yum     >/dev/null 2>&1; then PM_FAMILY=rhel;   PM_CMD='sudo yum install'
+  elif command -v zypper  >/dev/null 2>&1; then PM_FAMILY=suse;   PM_CMD='sudo zypper install'
+  elif command -v pacman  >/dev/null 2>&1; then PM_FAMILY=arch;   PM_CMD='sudo pacman -S'
+  elif command -v apk     >/dev/null 2>&1; then PM_FAMILY=alpine; PM_CMD='sudo apk add'
+  elif command -v brew    >/dev/null 2>&1; then PM_FAMILY=brew;   PM_CMD='brew install'
+  fi
+}
+
+# The de-duplicated package list that covers the given commands.
+packages_for() { # packages_for <family> <command...>
+  local family="$1" c p; shift
+  local -a out=()
+  for c in "$@"; do
+    p="$(pkg_for "$c" "$family")"
+    [ -n "$p" ] || continue
+    name_in "$p" ${out[@]+"${out[@]}"} || out+=("$p")
+  done
+  printf '%s' "${out[*]}"
+}
+
+REQUIRED=(find du df awk sort numfmt tput)
+MISSING=()
+for cmd in "${REQUIRED[@]}"; do
+  command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+done
+
+if [ "${#MISSING[@]}" -gt 0 ]; then
+  {
+    printf 'reclaim needs these commands, which are not installed:\n\n'
+    for cmd in "${MISSING[@]}"; do printf '    %s\n' "$cmd"; done
+    printf '\nInstall them with:\n\n'
+    detect_pm
+    if [ -n "$PM_CMD" ]; then
+      printf '    %s %s\n\n' "$PM_CMD" "$(packages_for "$PM_FAMILY" "${MISSING[@]}")"
+    else
+      printf '    sudo apt install %s      # Debian, Ubuntu, Mint\n' \
+        "$(packages_for debian "${MISSING[@]}")"
+      printf '    sudo dnf install %s      # Fedora, RHEL, Rocky, Alma\n\n' \
+        "$(packages_for rhel "${MISSING[@]}")"
+    fi
+  } >&2
+  exit 1
+fi
+
+# git is optional: without it the ambiguous build/dist/target names cannot be
+# checked against .gitignore, so they are detected far more conservatively.
+if ! command -v git >/dev/null 2>&1; then
+  detect_pm
+  printf 'note: git is not installed, so build/ dist/ target/ detection stays conservative.\n' >&2
+  [ -n "$PM_CMD" ] && printf '      install it with: %s git\n' "$PM_CMD" >&2
+fi
+
+# ------------------------------------------------------------- guard rails
+#
+# The two setups where a mistake stops being recoverable, refused outright
+# rather than warned about. System directories are full of things that look
+# exactly like build output (/usr/lib/node_modules, /var/cache) but belong to
+# the package manager: deleting them breaks the system, and no amount of git
+# checking helps.
+
 ROOT="$(cd "$ROOT" && pwd -P)" || exit 1
+
+SYSTEM_DIRS=(/ /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /media /mnt /opt
+             /proc /root /run /sbin /srv /sys /usr /var)
+
+refuse() {
+  printf '%s\n\nRe-run with --unsafe if you really mean it.\n' "$1" >&2
+  exit 3
+}
+
+if [ "$UNSAFE" -eq 0 ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    refuse "reclaim refuses to run as root.
+It deletes directories with rm -rf; as root a mistake takes the system with it.
+Run it as your normal user, on your own files."
+  fi
+  if name_in "$ROOT" "${SYSTEM_DIRS[@]}"; then
+    refuse "reclaim refuses to scan $ROOT: that is a system directory.
+Point it at a directory you own, such as your home directory:
+    reclaim              # scans $HOME
+    reclaim --dir ~/Workspace"
+  fi
+fi
+
 MIN_BYTES="$(numfmt --from=iec "$MIN_HUMAN" 2>/dev/null)" ||
   { printf 'bad --min value: %s\n' "$MIN_HUMAN" >&2; exit 2; }
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/reclaim"
@@ -157,13 +299,6 @@ project_of() {
   fi
   for d in "${chain[@]}"; do PROJCACHE["$d"]="$found"; done
   printf '%s' "$found"
-}
-
-name_in() { # name_in <needle> <haystack...>
-  local needle="$1"; shift
-  local x
-  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
-  return 1
 }
 
 build_name_expr() { # echo a "-name a -o -name b" clause for the given names
@@ -743,10 +878,6 @@ tui() {
 }
 
 # ---------------------------------------------------------------------- main
-
-for cmd in find du df awk sort numfmt; do
-  command -v "$cmd" >/dev/null || { printf 'missing required command: %s\n' "$cmd" >&2; exit 1; }
-done
 
 if [ "$FORCE_RESCAN" -eq 1 ] || [ ! -s "$AGG" ]; then
   scan
